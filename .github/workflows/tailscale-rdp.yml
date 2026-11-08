@@ -1,0 +1,135 @@
+name: Tailscale RDP + Telegram
+
+on:
+  workflow_dispatch:
+
+jobs:
+  remote-desktop:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Speed up runner
+        shell: powershell
+        run: |
+          # Less CPU load = smoother RDP
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name VisualFXSetting -Value 2 -ErrorAction SilentlyContinue
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          Write-Host "Tweaks applied."
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: gh-runner
+
+      - name: Enable RDP
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              Write-Error "RDP_PASSWORD secret is missing."
+              exit 1
+          }
+
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          net user runneradmin "$env:RDP_PASSWORD"
+          Write-Host "RDP enabled for user: runneradmin"
+
+      - name: Limit RDP resolution and color
+        shell: powershell
+        run: |
+          $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $p -Force | Out-Null
+          Set-ItemProperty -Path $p -Name MaxXResolution -Value 1280 -Type DWord
+          Set-ItemProperty -Path $p -Name MaxYResolution -Value 720 -Type DWord
+          Set-ItemProperty -Path $p -Name ColorDepth -Value 3 -Type DWord
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP capped at 1280x720, 16-bit color."
+
+      - name: Show Tailscale IP
+        shell: powershell
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) { $ts = "tailscale" }
+          Start-Sleep -Seconds 5
+          $ip = (& $ts ip -4 | Out-String).Trim()
+          Write-Host "========================================"
+          Write-Host "Tailscale IP: $ip"
+          Write-Host "Host name:    gh-runner"
+          Write-Host "User:         runneradmin"
+          Write-Host "========================================"
+
+      - name: Install Telegram Desktop
+        shell: powershell
+        run: |
+          winget install `
+            --id Telegram.TelegramDesktop `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements `
+            --disable-interactivity
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Telegram install failed."
+              exit 1
+          }
+          Write-Host "Telegram installed. Launch it from inside your RDP session."
+
+      - name: Download and extract Summertime Saga
+        shell: powershell
+        env:
+          SSAGA_URL: ${{ secrets.SSAGA_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SSAGA_URL)) {
+              Write-Error "SSAGA_URL secret is missing."
+              exit 1
+          }
+
+          $zip  = "$env:TEMP\summertimesaga.zip"
+          $dest = "C:\Games\SummertimeSaga"
+
+          Write-Host "Downloading Summertime Saga..."
+          curl.exe -L --fail --retry 5 --retry-delay 5 -o $zip "$env:SSAGA_URL"
+
+          $size = (Get-Item $zip).Length
+          Write-Host "Downloaded: $size bytes"
+          if ($size -lt 100000000) {
+              Write-Error "File is too small, the link is probably not a direct download."
+              exit 1
+          }
+
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          Remove-Item $zip -Force
+
+          $exe = Get-ChildItem -Path $dest -Filter "*.exe" -Recurse |
+            Where-Object { $_.Name -like "SummertimeSaga*" } |
+            Select-Object -First 1
+
+          if ($exe) {
+              $desktop = "C:\Users\runneradmin\Desktop"
+              New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+              $s = (New-Object -ComObject WScript.Shell).CreateShortcut("$desktop\Summertime Saga.lnk")
+              $s.TargetPath = $exe.FullName
+              $s.WorkingDirectory = $exe.DirectoryName
+              $s.Save()
+              Write-Host "Shortcut created: $($exe.FullName)"
+          } else {
+              Write-Host "Extracted to $dest, but the .exe was not found. Look inside the folder."
+          }
+
+      - name: Keep Runner Alive
+        shell: powershell
+        run: |
+          while ($true) {
+              Write-Host "[$(Get-Date)] Runner active..."
+              Start-Sleep -Seconds 300
+          }
